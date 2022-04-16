@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"otaqu/database"
@@ -11,6 +12,7 @@ import (
 	"github.com/PuerkitoBio/goquery"
 	"github.com/gofiber/fiber/v2"
 	uuid "github.com/satori/go.uuid"
+	"github.com/shopspring/decimal"
 )
 
 func GetKupon(ctx *fiber.Ctx) error {
@@ -32,51 +34,70 @@ func GetKupon(ctx *fiber.Ctx) error {
 	if err != nil {
 		log.Fatal(err)
 	}
+	x := 0
 
-	rows := make([]model.GetKupon, 0)
-
-	doc.Find(".__deal_item").Children().Each(func(i int, sel *goquery.Selection) {
-		row := new(model.GetKupon)
-		row.Name = sel.Find(".__deal_item_title").Text()
-		row.Description = sel.Find(".__deal_item_description").Text()
-		doc.Find(".__deal_item_rating").Children().Each(func(i int, sel *goquery.Selection) {
-			row.Rating = sel.Find(".__deal_item_rating_rate").Text()
-		})
-		row.Price = sel.Find(".__deal_item_price_sell").Text()
-
-		rows = append(rows, *row)
-	})
-
-	for i := 0; i < len(rows); i++ {
-		if rows[i].Name != "" {
-			kupon.UUID = uuid.NewV4()
+	doc.Find("div.__deal_item").Children().Each(func(i int, sel *goquery.Selection) {
+		name := sel.Find(".__deal_item_title").Text()
+		if name != "" {
 			replacer := strings.NewReplacer("\n      ", "", "\n    ", "")
+			kupon.UUID = uuid.NewV4()
+			kupon.Name = replacer.Replace(sel.Find(".__deal_item_title").Text())
+			kupon.Description = replacer.Replace(sel.Find(".__deal_item_description").Text())
 
-			kupon.Name = replacer.Replace(rows[i].Name)
-			kupon.Description = replacer.Replace(rows[i].Description)
-			value, err := strconv.ParseFloat(strings.Replace(rows[i].Rating, "/10", "", -1), 32)
+			doc.Find("div.__deal_item_buy").Children().Each(func(j int, d *goquery.Selection) {
+				full := d.Find("i.fa-star").Size()
+				half := d.Find("i.fa-star-half").Size()
+				valFull := float32(full)
+				valHalf := float32(half) * 0.5
+				rating := valFull + valHalf
+				kupon.Rating = decimal.NewFromFloat32(float32(rating))
+
+			})
+
+			link, _ := sel.Attr("href")
+			err := database.DB.Create(&kupon).Error
 			if err != nil {
-				kupon.Rating = 0
+				x--
 			}
-			kupon.Rating = float32(value)
+			if link != "" {
+				dtl, err := http.Get(link)
+				if err != nil {
+					log.Fatal(err)
+				}
+				defer dtl.Body.Close()
 
-			KuponPrice.UUID = uuid.NewV4()
-			KuponPrice.KuponID = kupon.UUID
-			replacer = strings.NewReplacer("Rp", "", ".", "")
-			price, _ := strconv.Atoi(replacer.Replace(rows[i].Price))
+				if dtl.StatusCode != 200 {
+					log.Fatalf("status code error: %d %s", dtl.StatusCode, dtl.Status)
+				}
 
-			if err != nil {
-				KuponPrice.Price = 0
+				det, err := goquery.NewDocumentFromReader(dtl.Body)
+				if err != nil {
+					log.Fatal(err)
+				}
+
+				det.Find("div.__box.__box_shadow").Find("div.row").Children().Each(func(i int, d *goquery.Selection) {
+					KuponPrice.UUID = uuid.NewV4()
+					KuponPrice.KuponID = kupon.UUID
+					KuponPrice.Name = d.Find("h3").Text()
+					replacer = strings.NewReplacer("Rp", "", ".", "")
+
+					price, _ := strconv.Atoi(replacer.Replace(d.Find("li.__deal_detail_package_list").Find("div.h4").Text()))
+
+					if err != nil {
+						KuponPrice.Price = 0
+					}
+					KuponPrice.Price = uint64(price)
+					database.DB.Create(&KuponPrice)
+
+				})
 			}
-			KuponPrice.Price = uint64(price)
 
-			database.DB.Create(&kupon)
-			database.DB.Create(&KuponPrice)
+			x++
 		}
-	}
-	response.Success = true
-	response.Message = "Proses Scrapping Berhasil"
 
+	})
+	response.Success = true
+	response.Message = fmt.Sprintf("%d%s", x, " Data Berhasil di Scraping")
 	return ctx.JSON(response)
 
 }
@@ -84,24 +105,11 @@ func GetKupon(ctx *fiber.Ctx) error {
 func ShowKupon(ctx *fiber.Ctx) error {
 	var response model.Response
 	kupons := []model.Kupon{}
-	kupon := model.Kupon{}
-	kuponPrice := model.KuponPrice{}
 
-	rows, _ := database.DB.Table("kupons as k").
-		Joins("Join kupon_prices as kp on k.uuid = kp.kupon_id").
-		Select("k.*,kp.uuid,kp.kupon_id,kp.price,kp.created_at,kp.updated_at").Rows()
-
-	for rows.Next() {
-		err := rows.Scan(&kupon.UUID, &kupon.Name, &kupon.Description, &kupon.Rating, &kupon.CreatedAt, &kupon.UpdatedAt, &kuponPrice.UUID, &kuponPrice.KuponID, &kuponPrice.Price, &kuponPrice.CreatedAt, &kuponPrice.UpdatedAt)
-		if err != nil {
-			log.Panic(err)
-		}
-		kupon.KuponPrice = kuponPrice
-		kupons = append(kupons, kupon)
-	}
+	data := database.DB.Preload("KuponPrice").Find(&kupons)
 	response.Success = true
 	response.Message = "Proses Berhasil"
-	response.Data = kupons
+	response.Data = data
 
 	return ctx.JSON(response)
 
